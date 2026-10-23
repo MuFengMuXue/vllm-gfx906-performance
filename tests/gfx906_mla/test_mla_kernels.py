@@ -26,6 +26,7 @@ import torch
 from vllm.gfx906_mla.ops.mla_decode_attention import decode_attention_fwd
 from vllm.gfx906_mla.ops.prefill_attention import varlen_attn
 from vllm.gfx906_mla.prefill import Gfx906TritonMLAPrefill
+from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 PAGE = 400  # a real MLA page size: the kernel requires a tile to fit inside one page
 
@@ -176,9 +177,12 @@ def _prefill_reference(q, k, v, q_start, q_len, k_start, k_len, scale, causal):
                 >= torch.arange(nk, device=q.device)[None, :]
             )
             scores = scores.masked_fill(~visible, float("-inf"))
-        lses.append(torch.logsumexp(scores, -1).T)
+        lses.append(torch.logsumexp(scores, -1))
         outs.append(torch.einsum("hqk,khd->qhd", torch.softmax(scores, -1), vb))
-    return torch.cat(outs), torch.cat(lses)
+    # MLA prefill backends return the LSE as [num_heads, num_tokens]; every caller
+    # (init_mla_context_partial, accumulate_mla_context_chunk, merge_attn_states)
+    # indexes it that way.
+    return torch.cat(outs), torch.cat(lses, dim=1)
 
 
 @pytest.mark.parametrize(
@@ -286,7 +290,7 @@ def test_backend_new_tokens_and_context_chunk():
         True,
     )
     torch.cuda.synchronize()
-    assert out.shape == q.shape and lse.shape == (48, heads)
+    assert out.shape == q.shape and lse.shape == (heads, 48)
     assert _rel(out.float(), ref_out) < 1e-2
 
     # out= is honoured in place (supports_out() is True: v is not padded)
@@ -319,4 +323,82 @@ def test_backend_new_tokens_and_context_chunk():
     )
     torch.cuda.synchronize()
     assert _rel(cout.float(), ref_c) < 5e-3
+    assert close.shape == (heads, 20)
     assert float((close - ref_c_lse).abs().max()) < 5e-2
+
+
+def test_context_chunk_merges_like_full_attention():
+    """The merge ``mla_attention`` performs for a prefix hit or a second chunk.
+
+    Suffix attention over the new tokens (causal) and prefix attention over the
+    cached context (non-causal), combined by the same kernel the model uses, must
+    equal one full attention over context + new tokens. This is the path an
+    inverted LSE layout slips through: ``merge_attn_states_kernel`` indexes
+    ``prefix_lse``/``suffix_lse`` as ``[num_heads, num_tokens]`` by raw stride, so a
+    transposed LSE is not an error there, it is silently wrong.
+    """
+    heads, dim = 12, 256
+    ctx, new = 37, 11
+    dev = torch.device("cuda:0")
+    torch.manual_seed(ctx * 1000 + new)
+    scale = 1.0 / math.sqrt(dim)
+    dtype = torch.bfloat16
+    q = torch.randn(new, heads, dim, dtype=dtype, device=dev) * 0.3
+    k_ctx = torch.randn(ctx, heads, dim, dtype=dtype, device=dev) * 0.3
+    v_ctx = torch.randn(ctx, heads, dim, dtype=dtype, device=dev) * 0.3
+    k_new = torch.randn(new, heads, dim, dtype=dtype, device=dev) * 0.3
+    v_new = torch.randn(new, heads, dim, dtype=dtype, device=dev) * 0.3
+
+    zero = torch.zeros(1, dtype=torch.int32, device=dev)
+    new_len = torch.tensor([new], dtype=torch.int32, device=dev)
+    ctx_len = torch.tensor([ctx], dtype=torch.int32, device=dev)
+
+    suffix_out, suffix_lse = varlen_attn(
+        q,
+        k_new,
+        v_new,
+        q_start=zero,
+        q_len=new_len,
+        k_start=zero,
+        k_len=new_len,
+        max_q_len=new,
+        scale=scale,
+        causal=True,
+        return_lse=True,
+    )
+    prefix_out, prefix_lse = varlen_attn(
+        q,
+        k_ctx,
+        v_ctx,
+        q_start=zero,
+        q_len=new_len,
+        k_start=zero,
+        k_len=ctx_len,
+        max_q_len=new,
+        scale=scale,
+        causal=False,
+        return_lse=True,
+    )
+    assert suffix_lse.shape == (heads, new), "LSE must be [num_heads, num_tokens]"
+    assert prefix_lse.shape == (heads, new)
+
+    merged = torch.empty_like(suffix_out)
+    merge_attn_states(
+        output=merged,
+        prefix_output=prefix_out,
+        prefix_lse=prefix_lse,
+        suffix_output=suffix_out,
+        suffix_lse=suffix_lse,
+    )
+
+    k_all = torch.cat([k_ctx, k_new]).float()
+    v_all = torch.cat([v_ctx, v_new]).float()
+    scores = torch.einsum("qhd,khd->hqk", q.float(), k_all) * scale
+    visible = (
+        torch.arange(ctx + new, device=dev)[None, :]
+        <= (ctx + torch.arange(new, device=dev))[:, None]
+    )
+    scores = scores.masked_fill(~visible[None], float("-inf"))
+    ref = torch.einsum("hqk,khd->qhd", torch.softmax(scores, -1), v_all)
+    torch.cuda.synchronize()
+    assert _rel(merged.float(), ref) < 1e-2

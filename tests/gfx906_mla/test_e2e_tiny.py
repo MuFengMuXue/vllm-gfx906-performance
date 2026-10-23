@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(
 VOCAB = 128
 
 
-def _generate(model_dir: pathlib.Path):
+def _generate(model_dir: pathlib.Path, prompts=None, **llm_kwargs):
     import vllm.gfx906_mla  # noqa: F401  (registers the architectures in this process)
     from vllm import LLM, SamplingParams
 
@@ -38,11 +38,11 @@ def _generate(model_dir: pathlib.Path):
         dtype="float16",  # what this platform serves dense Qwen3.x in
         max_num_seqs=4,
         compilation_config={"mode": "none"},  # eager: compile time is not the gate
+        **llm_kwargs,
     )
-    return llm.generate(
-        [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11]],
-        SamplingParams(max_tokens=8, temperature=0.0),
-    )
+    if prompts is None:
+        prompts = [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11]]
+    return llm.generate(prompts, SamplingParams(max_tokens=8, temperature=0.0))
 
 
 def _check(out) -> None:
@@ -69,3 +69,23 @@ def test_tiny_hybrid_model_generates(tmp_path: pathlib.Path) -> None:
     gfx906, unrelated to this port), hence the slow marker.
     """
     _check(_generate(build(tmp_path / "tiny_hybrid", hybrid=True)))
+
+
+@pytest.mark.slow_test
+def test_tiny_chunked_prefill_merges(tmp_path: pathlib.Path) -> None:
+    """Prefill with cached context: chunked at 16 tokens, then a prefix-cache hit.
+
+    The MLA context merge only runs when a prefill has cached context -- a chunk
+    boundary, or a prefix hit -- and that is the path that faulted the served
+    checkpoint while the plain single-chunk prefill was fine.
+    """
+    long_a = list(range(1, 41))
+    long_b = list(range(60, 100))
+    out = _generate(
+        build(tmp_path / "tiny_mla_chunked", hybrid=False),
+        [long_a, long_b, long_a],
+        max_num_batched_tokens=16,
+    )
+    _check(out[:2])
+    # The third request reuses the first request's KV; greedy output must match.
+    assert out[2].outputs[0].token_ids == out[0].outputs[0].token_ids

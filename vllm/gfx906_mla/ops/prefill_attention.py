@@ -39,7 +39,8 @@ def _fwd_kernel(
     stride_vh,
     stride_obs,
     stride_oh,
-    stride_lbs,
+    stride_lh,
+    stride_lt,
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -124,9 +125,14 @@ def _fwd_kernel(
         mask=out_mask,
     )
     # exp2-domain m/l -> natural-log LSE, the convention merge_attn_states uses.
+    # LSE is [num_heads, num_tokens], as every MLA prefill backend returns it.
     lse = (m_i + tl.math.log2(l_i)) * _LN2
     lse = tl.where(offs_m < q_len, lse, float("-inf"))
-    tl.store(Lse + (q_start + offs_m) * stride_lbs + cur_head, lse, mask=offs_m < q_len)
+    tl.store(
+        Lse + cur_head * stride_lh + (q_start + offs_m) * stride_lt,
+        lse,
+        mask=offs_m < q_len,
+    )
 
 
 def _tile_shape(head_dim: int, dtype: torch.dtype) -> tuple[int, int, int]:
@@ -170,7 +176,7 @@ def varlen_attn(
         scale: softmax scale (1/sqrt(head_dim) for these models).
         causal: apply the causal mask, shifted by (q_start - k_start).
         out: optional [sum(q_len), heads, head_dim] destination.
-        return_lse: also return the natural-log LSE [sum(q_len), heads].
+        return_lse: also return the natural-log LSE [heads, sum(q_len)].
 
     Returns:
         The attention output, or ``(output, lse)`` when ``return_lse`` is set.
@@ -191,7 +197,7 @@ def varlen_attn(
     num_reqs, num_heads = q_len.shape[0], q.shape[1]
     if out is None:
         out = torch.empty_like(q)
-    lse = torch.empty((q.shape[0], num_heads), dtype=torch.float32, device=q.device)
+    lse = torch.empty((num_heads, q.shape[0]), dtype=torch.float32, device=q.device)
 
     block_m, block_n, num_warps = _tile_shape(head_dim, q.dtype)
     grid = (num_reqs, num_heads, triton.cdiv(max_q_len, block_m))
@@ -215,6 +221,7 @@ def varlen_attn(
         out.stride(0),
         out.stride(1),
         lse.stride(0),
+        lse.stride(1),
         BLOCK_M=block_m,
         BLOCK_DMODEL=triton.next_power_of_2(head_dim),
         BLOCK_N=block_n,
@@ -228,5 +235,34 @@ def varlen_attn(
     return out
 
 
-def _register_warmup() -> None:
-    """Nothing to warm: constexpr choices are fixed per (dtype, head_dim)."""
+def warmup(
+    *,
+    head_dim: int,
+    num_heads: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    """Compile ``_fwd_kernel`` for this (dtype, head_dim, causal) before serving.
+
+    Nothing else runs the context-chunk call until a prefill has cached context (a
+    prefix hit, or a prompt longer than ``max_num_batched_tokens``), so without this
+    the kernel first compiles inside a request.
+    """
+    rows = 32
+    q = torch.zeros((rows, num_heads, head_dim), dtype=dtype, device=device)
+    zero = torch.zeros(1, dtype=torch.int32, device=device)
+    n = torch.tensor([rows], dtype=torch.int32, device=device)
+    for causal in (True, False):
+        varlen_attn(
+            q,
+            q,
+            q,
+            q_start=zero,
+            q_len=n,
+            k_start=zero,
+            k_len=n,
+            max_q_len=rows,
+            scale=head_dim**-0.5,
+            causal=causal,
+            return_lse=True,
+        )
