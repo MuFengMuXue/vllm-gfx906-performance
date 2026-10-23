@@ -175,6 +175,27 @@ Two defects surfaced, one fixed and one open:
    **The port now defaults `QWEN_MLA_PREFIX_UNIT=0`** (no partial hits); set it to 16 only
    when debugging that path.
 
+## Where this stands, and what is next
+
+**Works today** (recipe: `_serve_qwen_mla.sh`): TP=2, fp16, text-only, KV capped
+explicitly; correct greedy output, 14.5-20.9 tok/s decode, 411 tok/s prefill, 21.5k tokens
+of KV at a 2 GiB cap, prefix caching limited to block-aligned hits.
+
+**Open work is tracked in `ROADMAP.md`** (forward-looking material lives there, not here):
+
+| id | item | why it matters |
+|---|---|---|
+| QMLA-1 | partial prefix-cache hits kill the TP worker | without it, hits align to `lcm(16,784,1024) = 50 176` tokens, i.e. no reuse below 50k; agent/multi-turn serving loses its main win |
+| QMLA-2 | MTP k=3 | the teacher's drafter is unused; the plugin measured 1.3-2.1x, and half the teacher's decode speed is the gap to close |
+| QMLA-3 | KV capacity on 16 GB cards | the vision tower and MTP weights cost ~1.5 GiB of KV for a text-only workload |
+| QMLA-4 | decode/prefill tuning | the vendored kernel reaches ~20 GB/s of ~800 GB/s peak at the TP=2 local shapes |
+| QMLA-5 | quality gate vs the teacher | nothing has been compared to `Qwen3.8-27B-AWQ-INT4` yet |
+| QMLA-6 | recipe + docs | done for the recipe (`_serve_qwen_mla.sh`); README row pending |
+
+Not attempted, still true: TP=1 (the widest latent needs the CUDA-gated two-pass kernel),
+FP8 KV (no hardware conversion), vision serving (weights load, but nothing was exercised),
+and DCP (refused by the metadata builder).
+
 ## Interactions / superseded-by
 
 - Replaces nothing; the fork had no dense-MLA serving path (the MLA-sparse work is

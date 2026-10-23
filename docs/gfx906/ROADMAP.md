@@ -88,6 +88,71 @@ re-run (none; #47930/#61261/#60174/#57032/#51581 all different), issue body read
 Left: post it. The acceptance numbers are from the **pre-refactor** shape — say so
 in the report (the persistence is code inference, not a re-measurement).
 
+## Now — Qwen3.8 MLA retrofit (vendored `qwen-mla-vllm`)
+
+Package: `vllm/gfx906_mla/` (`docs/gfx906/DEVLOG-qwen-mla.md`). State 2026-10-23:
+`Qwen3.8-27B-GLA-g2-INT4` serves correctly at TP=2 in fp16 (greedy answers, exact echo,
+`391`), 10.6 GiB of weights/GPU, 21.5k tokens of KV at `--kv-cache-memory-bytes 2 GiB`,
+14.5-20.9 tok/s decode and 411 tok/s prefill at batch 1. TP=1 is out of reach until the
+two-pass decode kernel is ported (rank 1792 needs 128 KB of LDS; the device has 64 KB).
+
+### QMLA-1 — partial prefix-cache hits kill the TP worker · (issue TBD)
+
+**Blocks every prefix-cache benefit**: with partial hits off, hits align to
+`scheduler_block_size = lcm(16, 784, 1024) = 50 176` tokens, i.e. nothing reuses below 50k.
+**Repro:** two `/v1/completions` calls whose prompts share a prefix with
+`QWEN_MLA_PREFIX_UNIT=16`; the second gets a sub-block hit, the scheduler issues 64
+`kv_cache_block_copies`, and the TP1 worker exits with no traceback. **Deliverable:** name
+the faulting kernel (`TORCH_SHOW_CPP_STACKTRACES`, `PYTHONFAULTHANDLER`,
+`AMD_SERIALIZE_KERNEL`), then bisect `--mamba-cache-mode none` vs `align` to separate the
+mamba boundary-state CoW from the MLA block copy; check the fork's LBNHC packed layout
+against `copy_kv_cache_blocks_inplace`'s `set_(storage)` branch. **Gate:** two requests
+sharing a prefix, unit 16, no crash, `Prefix cache hit rate` > 0, and a 2-turn TTFT
+improvement measured per `dvfs-mi50.md`. Refs: DEVLOG-qwen-mla.md, `_smoke_mla.sh`.
+
+### QMLA-2 — MTP k=3 on the retrofit · (issue TBD)
+
+The checkpoint keeps the teacher's MTP head; the plugin measured 1.3-2.1x. **Deliverable:**
+`--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`, and confirm the
+spec-decode graph-capture patch (GDN dummy-run draft tokens) holds for this model and that
+the draft layer keeps FULL decode graphs. **Gate:** greedy output unchanged up to
+near-ties, decode t/s at 1k/8k vs the 14.5-20.9 tok/s baseline, KV cost of the draft cache
+recorded.
+
+### QMLA-3 — KV capacity on 16 GB cards · (issue TBD)
+
+**Deliverable:** measure three levers at fixed `--kv-cache-memory-bytes`: (a) text-only
+architecture via `--hf-overrides '{"architectures":["Qwen3_5MLAForCausalLM"]}'` to drop the
+vision tower and MTP weights (~1.5 GiB, the plugin's `language_model.` strip already
+supports it); (b) `QWEN_MLA_PREFILL_WS_ROWS` (profile/prefill scratch vs KV budget);
+(c) uniform MLA rows (one page size -> one block size -> LCM ~1 KiB, so block-granularity
+prefix hits work) at 2x KV cost, as the alternative to QMLA-1. **Gate:** tokens of KV at
+the same cap, plus decode t/s within noise of the baseline.
+
+### QMLA-4 — decode and prefill tuning · (issue TBD)
+
+Standalone, the vendored decode kernel reaches ~20 GB/s of ~800 GB/s peak at the TP=2
+local shapes (rank 448/896), so there is 3-5x of headroom by the fork's own history.
+**Deliverable:** tune `BLOCK_H`/`BLOCK_N`/splits/waves for gfx906, or fold the rms support
+into the fork's already-tuned `vllm/v1/attention/ops/triton_decode_attention.py` and drop
+the second fork; then the prefill backend (411 tok/s vs the fork's FA prefill).
+**Gate:** serving A/B at pp/tg per `dvfs-mi50.md` (standalone microbench is evidence only).
+
+### QMLA-5 — quality gate against the teacher · (issue TBD)
+
+Nothing has been compared to `Qwen3.8-27B-AWQ-INT4` yet. **Deliverable:** the fork's
+442-token PPL probe on both models, a long-context needle, and a greedy disagreement rate
+on a fixed prompt set (the retrofit is trained to mimic the teacher, so a bounded
+disagreement is the right shape of the check). **Gate:** PPL inside the fork's dense band
+and no coherence regression at 8k+; numbers in the devlog.
+
+### QMLA-6 — recipe + docs · (issue TBD)
+
+**Deliverable:** `docs/gfx906/_serve_qwen_mla.sh` with the validated flags (fp16, explicit
+`--kv-cache-memory-bytes`, text-only limits), the README model-support row, and the
+`--reasoning-parser qwen3` / thinking-off note for smoke tests. **Gate:** recipe runs from a
+clean shell on this box.
+
 ## Next — 0.30-post and 0.31
 
 ### QSA-FN-10 — next tester measurement list · [#5](../../issues/5)
