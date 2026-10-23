@@ -46,6 +46,7 @@ vllm = "vllm.entrypoints.cli.main:main"
 lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
 lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
 gfx906_fa = "vllm.gfx906_fa.gfx906_fa_backend:register"
+gfx906_mla = "vllm.gfx906_mla:register"
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
@@ -66,6 +67,15 @@ include = ["vllm*"]
 "benchmarks/kernels/gfx906/*" = ["B023", "F821"]
 # test args are mostly pytest fixtures, which don't benefit from descriptions
 "tests/**" = ["D417"]
+# MLA decode kernel: a near-verbatim fork of the upstream Triton kernel (and of the vendored
+# plugin's copy) -- reformatting it would make every future diff against those unreadable.
+"vllm/gfx906_mla/ops/mla_decode_attention.py" = ["E501", "SIM102"]
+# Vendored from qwen-mla-vllm (Apache-2.0, TelperionAI): the code is formatted, but its prose
+# rationale is kept as published so it stays comparable with the plugin it came from.
+"vllm/gfx906_mla/model.py" = ["E501"]
+"vllm/gfx906_mla/model_vl.py" = ["E501"]
+"vllm/gfx906_mla/mla_impl.py" = ["E501"]
+"vllm/gfx906_mla/partial_rope.py" = ["E501"]
 
 [tool.ruff.lint]
 select = [
