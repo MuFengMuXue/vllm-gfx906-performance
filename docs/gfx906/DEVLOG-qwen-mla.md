@@ -54,6 +54,23 @@ exists — with the CUDA-only pieces dropped rather than ported.
 - `pyproject.toml`: entry point + per-file `E501` exemptions for the vendored kernel and
   the plugin's prose.
 
+## The real checkpoint's geometry (T2=2 target)
+
+`Qwen3.8-27B-GLA-g2-INT4` (22 GB, compressed-tensors `pack-quantized` W4A16, latent
+projections excluded from quantization):
+
+- 64 layers, full attention every 4th (`layer_types`), 24 query heads / 4 KV heads,
+  `head_dim` 256, hidden 5120, vocab 248320, one MTP layer, vision tower present.
+- `mla_ranks` = {256, 768, 1792} over 16 full-attention layers; `mla_latent_groups` = 2,
+  so at TP=2 each rank caches **128 / 384 / 896** latent dims.
+- Partial RoPE: `mla_rope_keep` keeps 29 of 32 subspaces → `rope_dim` 58
+  (`mla_qk_rope_head_dim` 58), so the packed rope block is `2 groups * 58 = 116` and the
+  rms tail is 12 → tail 128.
+- Therefore rows are **256 / 512 / 1024** elements: an exact 1:2:4 ratio, so the page
+  unifier scales block sizes instead of padding (which vLLM 0.32 refuses for MLA).
+- The checkpoint declares an FP8 `kv_cache_scheme`; the port resolves `auto` to a
+  non-FP8 cache and refuses an explicit `--kv-cache-dtype fp8`.
+
 ## Evidence — FOR
 
 - Decode kernel numerics on MI50 (rank 512 / packed rope 128 / 24 heads, page 64, 900

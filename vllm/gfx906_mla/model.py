@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 
 import torch
 from torch import nn
@@ -129,6 +130,16 @@ class Qwen3_5MLAAttention(nn.Module):
         self.declared_rope = self.head_size - self.kv_lora_rank
         self.rope_pad = self.declared_rope - self.packed_rope - self.num_heads
         assert self.rope_pad >= 0, f"padded head_size {self.head_size} too small"
+
+        if os.environ.get("QWEN_MLA_ROW_DEBUG", "1") == "1":
+            print(
+                f"[gfx906-mla] {prefix}: rank {kv_lora_rank} + tail {self.declared_rope} "
+                f"= row {self.head_size} (packed rope {self.packed_rope}, rms {self.num_heads}, "
+                f"pad {self.rope_pad}); rope_dim {self.rope_dim}, rope_groups "
+                f"{self.rope_first}..{self.rope_first + self.rope_span - 1}",
+                file=sys.stderr,
+                flush=True,
+            )
 
         self.q_proj = ColumnParallelLinear(
             config.hidden_size,
