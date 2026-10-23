@@ -138,9 +138,20 @@ projections excluded from quantization):
   produce sane keys.
 - Output is **correct** in eager and in graph mode, with and without prefix caching, at
   `max-model-len` 1024: `' Paris.\nThe capital of Germany is Berlin.'`, `391` for 17*23, and
-  an exact echo test. First numbers (graph mode, batch 1, 2 GiB KV): **19.3 tok/s** decode
-  for 256 tokens; prefill timed at ~33 tok/s on a 198-token prompt (launch-bound and first
-  request, not yet a real prefill number).
+  an exact echo test.
+- **Throughput** (graph mode, TP=2, 2 GiB KV, batch 1, `max-model-len` 2048, greedy):
+
+  | arm | result |
+  |---|---|
+  | decode, short prompt | 14.5 tok/s (128 tokens, includes the prefill) |
+  | decode, ~340-token context | 20.9 tok/s (64 tokens) |
+  | prefill, 342-token prompt | **411 tok/s** (3 runs, 0.83 s each) |
+
+  For reference the fork's base model (no retrofit) runs 40.8 tok/s TP=2 greedy at 2k on
+  this box, so the retrofit is at roughly half the teacher's decode with MTP off and the
+  generic Triton MLA kernel -- expected for a first cut, and the obvious next lever is
+  `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`.
+  These are single-sample numbers: read `dvfs-mi50.md` before quoting them.
 
 Two defects surfaced, one fixed and one open:
 
@@ -155,10 +166,14 @@ Two defects surfaced, one fixed and one open:
    gets a hit that lands *inside* a block (192 of 198 tokens). vLLM then issues a
    copy-on-write of 64 blocks and the TP1 worker dies with `exit code: None` (no traceback
    -- a hard fault, not a Python error). With `QWEN_MLA_PREFIX_UNIT=0` (partial hits off)
-   the same traffic is clean. 0.32 already trims every full-attention group (the plugin's
-   third prefix-cache fix is upstream), so the surviving suspect is the COW/copy path for
-   this hybrid layout, not the hit reconciliation. Repro: two `/v1/completions` calls whose
-   prompts share a prefix, at `--prefix-match-unit 16`.
+   the same traffic is clean (block-aligned hits: `1st/2nd/3rd/4th` requests, the third
+   adding a suffix so the hit lands inside a block, all coherent, no crash). 0.32 already
+   trims every full-attention group (the plugin's third prefix-cache fix is upstream), so
+   the surviving suspect is 0.32's new block-copy path (`kv_cache_block_copies` in the
+   scheduler output) for this hybrid layout, not the hit reconciliation. Repro: two
+   `/v1/completions` calls whose prompts share a prefix, at `--prefix-match-unit 16`.
+   **The port now defaults `QWEN_MLA_PREFIX_UNIT=0`** (no partial hits); set it to 16 only
+   when debugging that path.
 
 ## Interactions / superseded-by
 

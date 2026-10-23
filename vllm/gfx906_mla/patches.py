@@ -253,6 +253,12 @@ def prefix_cache_hit_granularity() -> None:
     """Default ``--prefix-match-unit`` for prefix caching (``--mamba-cache-mode
     align``).
 
+    Defaults to 0 -- vLLM's own block granularity, i.e. no partial hits. A finer unit
+    (``QWEN_MLA_PREFIX_UNIT=16``, what the upstream plugin ships) makes hits land inside
+    a block, and on this hybrid layout that path dies: a second request sharing a prefix
+    issues a copy-on-write and the TP worker exits with no traceback (2026-10-23, see
+    DEVLOG-qwen-mla.md). Block-aligned hits are correct.
+
     The MLA layers have different latent widths, and vLLM equalises their page sizes by
     giving each width its own block size (1x, 2x, 4x the cache block). With the default
     hash unit (the GCD, which is also the linear-attention block) vLLM rounds every hit
@@ -271,7 +277,7 @@ def prefix_cache_hit_granularity() -> None:
     def verify_and_update_config(cls, vllm_config):
         orig(cls, vllm_config)
         cache_config = vllm_config.cache_config
-        want = os.environ.get("QWEN_MLA_PREFIX_UNIT", "16")
+        want = os.environ.get("QWEN_MLA_PREFIX_UNIT", "0")
         if (
             ours_from(vllm_config)
             and cache_config.enable_prefix_caching
