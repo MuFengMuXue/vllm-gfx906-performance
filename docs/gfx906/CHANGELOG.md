@@ -8,6 +8,36 @@ the date an investigation began. Since 2026-09-27 open work is tracked as
 GitHub issues on `KIntegrated/vllm-gfx906-mobydick`; `ROADMAP.md` is the ordered
 index, and closing an item means recording it here and deleting its roadmap line.
 
+## 2026-10-23 (QMLA-1 closed — MLA prefix-cache hits work; the fault was our LSE layout)
+
+The Qwen3.8 MLA retrofit now serves sub-block prefix-cache hits
+(`QWEN_MLA_PREFIX_UNIT=16`) instead of needing them disabled.
+
+- **The recorded diagnosis was wrong.** The faulting kernel is
+  `merge_attn_states_kernel` (`Memory Fault Error ... faulting addr: 0x7fefb3c00000`, GPU
+  index 1), 55 s *before* the worker was reaped; the 64 `kv_cache_block_copies` in the
+  scheduler dump are the last output before the death, not the trigger.
+- **Root cause** (`36cfcf0969`): `varlen_attn` returned the prefill log-sum-exp as
+  `[num_tokens, num_heads]`, while `init_mla_context_partial`,
+  `accumulate_mla_context_chunk` and `merge_attn_states_kernel` all index
+  `[num_heads, num_tokens]`. Every prefill with cached context — a hit, or a prompt longer
+  than `max_num_batched_tokens` — merged on the wrong axis, and the accumulator was sized
+  `[tokens, tokens]`.
+- **Gates**: the reference in `test_mla_kernels.py` had been transposed to match the bug.
+  It now builds `[heads, tokens]`; a new case merges a suffix and a context chunk with
+  vLLM's own `merge_attn_states` against a full-attention reference, and a chunked-prefill
+  + prefix-hit e2e case runs the path through the engine. Reverting only the layout fails
+  the merge gate.
+- **Serving evidence** (TP=2 fp16, 2 GiB KV, unit 16): a 1,223-token prompt cold, the same
+  prompt repeated (1,216-token hit, `Prefix cache hit rate 34.3%`), a different
+  1,104-token prompt, then the coherence prompts — all 200 with correct output
+  (`The quick brown fox jumps`, `Sphinx of black quartz, judge`, `391`, `**Paris**`), and
+  the engine stays up.
+- **Also**: the prefill and merge kernels compile at backend construction now; they only
+  run once a prefill has cached context, so they used to JIT inside the first request.
+  Records: `DEVLOG-qwen-mla.md` (with a corrected hit-alignment note: the logged
+  `kv lcm block sizes 3136`, not the earlier 50,176).
+
 ## 2026-10-22 (P32-3/#62 closed — Mamba prefill checkpoints now default OFF)
 
 Upstream enables a Mamba2 prefill checkpoint unconditionally; on this box that

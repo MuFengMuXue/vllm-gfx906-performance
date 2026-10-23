@@ -12,6 +12,7 @@ MLA-specific kernel at all: two ragged attention calls per chunk, plus the LSE t
 ``merge_attn_states`` consumes.
 """
 
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -89,8 +90,9 @@ class Gfx906TritonMLAPrefill(MLAPrefillBackend):
         """Compile the prefill and merge kernels before the first request.
 
         Neither runs until a prefill has cached context: a prefix-cache hit, or a
-        prompt longer than ``max_num_batched_tokens``. Compiling them inside a
-        request has faulted the worker on this platform, so pay for it at startup.
+        prompt longer than ``max_num_batched_tokens``. Both would otherwise JIT inside
+        the first such request -- a latency spike, and a compile landing in the middle
+        of graph capture on ROCm.
         """
         if not torch.cuda.is_available():
             return
@@ -104,6 +106,7 @@ class Gfx906TritonMLAPrefill(MLAPrefillBackend):
             return
         _WARMED.add(key)
         try:
+            start = time.perf_counter()
             warmup_prefill(
                 head_dim=head_dim,
                 num_heads=self.num_heads,
@@ -117,6 +120,14 @@ class Gfx906TritonMLAPrefill(MLAPrefillBackend):
                 device=device,
             )
             torch.cuda.synchronize()
+            logger.info(
+                "gfx906 MLA prefill warmup: %s, dtype=%s, head_dim=%d, heads=%d, %.2fs",
+                device,
+                dtype,
+                head_dim,
+                self.num_heads,
+                time.perf_counter() - start,
+            )
         except Exception:
             logger.warning("gfx906 MLA prefill warmup failed", exc_info=True)
 

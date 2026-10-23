@@ -253,18 +253,19 @@ def prefix_cache_hit_granularity() -> None:
     """Default ``--prefix-match-unit`` for prefix caching (``--mamba-cache-mode
     align``).
 
-    Defaults to 0 -- vLLM's own block granularity, i.e. no partial hits. A finer unit
-    (``QWEN_MLA_PREFIX_UNIT=16``, what the upstream plugin ships) makes hits land inside
-    a block, and on this hybrid layout that path dies: a second request sharing a prefix
-    issues a copy-on-write and the TP worker exits with no traceback (2026-10-23, see
-    DEVLOG-qwen-mla.md). Block-aligned hits are correct.
+    Defaults to 16 -- the upstream plugin's unit, i.e. sub-block hits. Reset to 0
+    (vLLM's own block granularity) with ``QWEN_MLA_PREFIX_UNIT=0``.
 
     The MLA layers have different latent widths, and vLLM equalises their page sizes by
     giving each width its own block size (1x, 2x, 4x the cache block). With the default
     hash unit (the GCD, which is also the linear-attention block) vLLM rounds every hit
-    to the LCM of those blocks. A unit finer than the GDN block switches on vLLM's
+    to the LCM of those blocks -- 3,136 tokens in the logged configuration -- so a 2k
+    context never reuses anything. A unit finer than the GDN block switches on vLLM's
     partial hits: full-attention groups match inside a block, and the scheduler ends one
     prefill chunk at the prompt's last unit boundary so the GDN state there is kept.
+
+    This path used to fault the TP worker; the cause was this port's prefill LSE layout,
+    not the hit mechanism (2026-10-23, see DEVLOG-qwen-mla.md and CHANGELOG QMLA-1).
     """
     from vllm.model_executor.models.config import HybridAttentionMambaModelConfig
 
@@ -277,7 +278,7 @@ def prefix_cache_hit_granularity() -> None:
     def verify_and_update_config(cls, vllm_config):
         orig(cls, vllm_config)
         cache_config = vllm_config.cache_config
-        want = os.environ.get("QWEN_MLA_PREFIX_UNIT", "0")
+        want = os.environ.get("QWEN_MLA_PREFIX_UNIT", "16")
         if (
             ours_from(vllm_config)
             and cache_config.enable_prefix_caching

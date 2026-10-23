@@ -3,14 +3,16 @@
 #
 # Measured 2026-10-23 with this recipe: 10.6 GiB of weights per GPU, 21.5k tokens of KV at
 # a 2 GiB cache, 14.5-20.9 tok/s decode (batch 1) and 411 tok/s prefill on a 342-token
-# prompt. Prefix-cache partial hits are OFF (QWEN_MLA_PREFIX_UNIT=0): with them on, the
-# second request that reuses a prefix kills the TP worker -- see ROADMAP QMLA-1.
+# prompt. Prefix caching uses sub-block hits (QWEN_MLA_PREFIX_UNIT=16, the default): a
+# 1,223-token prompt served cold and repeated reused 1,216 tokens with correct output.
 #
 # Knobs, in the order they are worth touching:
 #   --kv-cache-memory-bytes   the real KV budget; gpu_memory_utilization alone over-asks on
 #                             a 16 GB card (OOM in the KV allocation at 0.92)
 #   --max-model-len           only bounds a single sequence; the KV pool is sized by the cap
-#   QWEN_MLA_PREFIX_UNIT      "0" (default, safe) or "16" (partial hits; crashes today)
+#   QWEN_MLA_PREFIX_UNIT      "16" (default: sub-block prefix-cache hits) or "0" (block
+#                             granularity; hits then round to the LCM of the group block
+#                             sizes, so a 2k context never reuses anything)
 #   QWEN_MLA_ROW_DEBUG=0      silence the per-layer row-width log
 set -euo pipefail
 

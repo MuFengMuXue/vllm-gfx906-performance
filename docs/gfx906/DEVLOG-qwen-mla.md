@@ -161,31 +161,57 @@ Two defects surfaced, one fixed and one open:
    linear's output dtype is the backend's choice here, and it does not always match the
    weights. The port now pins projection outputs and the prefill kernel's `q` to the layer
    input dtype, and `_k_up_raw` follows the served dtype after load.
-2. **Partial prefix-cache hits kill the worker (OPEN).** With the plugin's
-   `--prefix-match-unit 16` default (our patch), a second request sharing a prompt prefix
-   gets a hit that lands *inside* a block (192 of 198 tokens). vLLM then issues a
-   copy-on-write of 64 blocks and the TP1 worker dies with `exit code: None` (no traceback
-   -- a hard fault, not a Python error). With `QWEN_MLA_PREFIX_UNIT=0` (partial hits off)
-   the same traffic is clean (block-aligned hits: `1st/2nd/3rd/4th` requests, the third
-   adding a suffix so the hit lands inside a block, all coherent, no crash). 0.32 already
-   trims every full-attention group (the plugin's third prefix-cache fix is upstream), so
-   the surviving suspect is 0.32's new block-copy path (`kv_cache_block_copies` in the
-   scheduler output) for this hybrid layout, not the hit reconciliation. Repro: two
-   `/v1/completions` calls whose prompts share a prefix, at `--prefix-match-unit 16`.
-   **The port now defaults `QWEN_MLA_PREFIX_UNIT=0`** (no partial hits); set it to 16 only
-   when debugging that path.
+2. **Partial prefix-cache hits crashed the worker; the cause was our LSE layout, not the
+   block copies (FIXED).** With `QWEN_MLA_PREFIX_UNIT=16`, a second request sharing a
+   prompt prefix hit 192 of 198 tokens, the scheduler issued 64 block copies, and the TP1
+   worker died with `exit code: None` (no traceback). The first reading blamed the copy
+   path. The log says otherwise: the first fault is
+
+   ```
+   Memory Fault Error [host: neko, GPU index: 1, faulting addr: 0x7fefb3c00000,
+       kernel: merge_attn_states_kernel]
+   Memory access fault by GPU node-2 ... Reason: Page not present or supervisor privilege.
+   ```
+
+   and the worker was reaped 55 s later, so the 64 `kv_cache_block_copies` are the last
+   scheduler output before the death, not the trigger. The defect was in the ported
+   prefill backend: `varlen_attn` returned the log-sum-exp as `[num_tokens, num_heads]`
+   while every MLA consumer indexes `[num_heads, num_tokens]` — `init_mla_context_partial`
+   sizes the accumulator from `shape[0]`, `accumulate_mla_context_chunk` slices
+   `output_lse[:, token_slice]`, and `merge_attn_states_kernel` reads it by raw stride.
+   Any prefill with cached context (a hit, or a prompt longer than
+   `max_num_batched_tokens`) therefore merged with the wrong axis and allocated a
+   `[tokens, tokens]` accumulator.
+
+   Fixed in `varlen_attn` (returns `[num_heads, num_tokens]`) plus new gates: a
+   merge-against-full-attention case that runs vLLM's own `merge_attn_states`, and a
+   chunked-prefill + prefix-hit e2e case. The old layout fails the merge gate. The prefill
+   and merge kernels are now also compiled at backend construction instead of during the
+   first request.
+
+   After the fix, same box and recipe, `QWEN_MLA_PREFIX_UNIT=16`: a 1,223-token prompt
+   cold, the same prompt repeated (hit 1,216 tokens, `Prefix cache hit rate 34.3%`), a
+   different 1,104-token prompt, and the coherence prompts all return 200 with correct
+   output (`'The quick brown fox jumps'`, `'Sphinx of black quartz, judge'`, `391`,
+   `'**Paris**'`), and the engine stays up. Partial hits no longer need to be off.
+
+   Correction to an earlier entry in this log: hit alignment is the LCM of the group block
+   sizes as logged, `kv lcm block sizes 3136` in the `--max-model-len 1024` configuration
+   (groups 784/1,568/3,136), not the 50,176 inferred from 784/1,024. Either way, with
+   partial hits off, a 2k context has no hit boundary to land on.
 
 ## Where this stands, and what is next
 
 **Works today** (recipe: `_serve_qwen_mla.sh`): TP=2, fp16, text-only, KV capped
 explicitly; correct greedy output, 14.5-20.9 tok/s decode, 411 tok/s prefill, 21.5k tokens
-of KV at a 2 GiB cap, prefix caching limited to block-aligned hits.
+of KV at a 2 GiB cap, and prefix caching with sub-block hits (`QWEN_MLA_PREFIX_UNIT=16`),
+including the merged-prefill path that a hit or a long prompt takes.
 
 **Open work is tracked in `ROADMAP.md`** (forward-looking material lives there, not here):
 
 | id | item | why it matters |
 |---|---|---|
-| QMLA-1 | partial prefix-cache hits kill the TP worker | without it, hits align to `lcm(16,784,1024) = 50 176` tokens, i.e. no reuse below 50k; agent/multi-turn serving loses its main win |
+| ~~QMLA-1~~ | ~~partial prefix-cache hits kill the TP worker~~ | **fixed**: LSE layout (see `CHANGELOG.md`) |
 | QMLA-2 | MTP k=3 | the teacher's drafter is unused; the plugin measured 1.3-2.1x, and half the teacher's decode speed is the gap to close |
 | QMLA-3 | KV capacity on 16 GB cards | the vision tower and MTP weights cost ~1.5 GiB of KV for a text-only workload |
 | QMLA-4 | decode/prefill tuning | the vendored kernel reaches ~20 GB/s of ~800 GB/s peak at the TP=2 local shapes |

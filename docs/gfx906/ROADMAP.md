@@ -93,22 +93,9 @@ in the report (the persistence is code inference, not a re-measurement).
 Package: `vllm/gfx906_mla/` (`docs/gfx906/DEVLOG-qwen-mla.md`). State 2026-10-23:
 `Qwen3.8-27B-GLA-g2-INT4` serves correctly at TP=2 in fp16 (greedy answers, exact echo,
 `391`), 10.6 GiB of weights/GPU, 21.5k tokens of KV at `--kv-cache-memory-bytes 2 GiB`,
-14.5-20.9 tok/s decode and 411 tok/s prefill at batch 1. TP=1 is out of reach until the
-two-pass decode kernel is ported (rank 1792 needs 128 KB of LDS; the device has 64 KB).
-
-### QMLA-1 — partial prefix-cache hits kill the TP worker · (issue TBD)
-
-**Blocks every prefix-cache benefit**: with partial hits off, hits align to
-`scheduler_block_size = lcm(16, 784, 1024) = 50 176` tokens, i.e. nothing reuses below 50k.
-**Repro:** two `/v1/completions` calls whose prompts share a prefix with
-`QWEN_MLA_PREFIX_UNIT=16`; the second gets a sub-block hit, the scheduler issues 64
-`kv_cache_block_copies`, and the TP1 worker exits with no traceback. **Deliverable:** name
-the faulting kernel (`TORCH_SHOW_CPP_STACKTRACES`, `PYTHONFAULTHANDLER`,
-`AMD_SERIALIZE_KERNEL`), then bisect `--mamba-cache-mode none` vs `align` to separate the
-mamba boundary-state CoW from the MLA block copy; check the fork's LBNHC packed layout
-against `copy_kv_cache_blocks_inplace`'s `set_(storage)` branch. **Gate:** two requests
-sharing a prefix, unit 16, no crash, `Prefix cache hit rate` > 0, and a 2-turn TTFT
-improvement measured per `dvfs-mi50.md`. Refs: DEVLOG-qwen-mla.md, `_smoke_mla.sh`.
+14.5-20.9 tok/s decode and 411 tok/s prefill at batch 1, with sub-block prefix-cache hits
+(`QWEN_MLA_PREFIX_UNIT=16`). TP=1 is out of reach until the two-pass decode kernel is
+ported (rank 1792 needs 128 KB of LDS; the device has 64 KB).
 
 ### QMLA-2 — MTP k=3 on the retrofit · (issue TBD)
 
