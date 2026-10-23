@@ -380,6 +380,25 @@ class Qwen3_5MLAAttention(nn.Module):
         sumsq = k_nope_raw.float().pow(2).sum(-1) + rope_sq[:, g_of_head]  # [n, nh]
         rms = sumsq.div(hd).add(self.eps).sqrt()  # [n, nh]
 
+        if os.environ.get("QWEN_MLA_DEBUG") and not getattr(self, "_dbg_done", False):
+            self._dbg_done = True
+
+            def _stat(name, t):
+                t = t.detach().float()
+                print(
+                    f"[gfx906-mla][dbg] {self.layer_name if hasattr(self, 'layer_name') else ''} "
+                    f"{name}: mean|.| {t.abs().mean():.4f} max|.| {t.abs().max():.4f} "
+                    f"dtype {t.dtype}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            _stat("c(latent)", c)
+            _stat("q_nope", q[..., rd:])
+            _stat("q_rope", q[..., :rd])
+            _stat("rms", rms)
+            _stat("k_rope_raw", kr_raw)
+
         # ONE rotary call for everything. vLLM rotates the leading rotary_dim of EVERY head, so
         # laying the rope block at the head-local offset 0 rotates all 24 query heads and all 4
         # rope keys in a single call -- no per-head loop, and no risk of rotating only group 0

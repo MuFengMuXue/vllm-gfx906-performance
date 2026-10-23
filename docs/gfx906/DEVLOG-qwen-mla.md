@@ -3,7 +3,7 @@
 > Branch `main` (user decision: no topic branch) · model `TelperionAI/Qwen3.8-27B-GLA-g2`
 > family (27B dense: 48 GDN + 16 MLA layers) · date `2026-10-23` · roadmap item: none yet.
 
-**VERDICT:** `SHIPPED` (the port; the *model* gate is still outstanding)
+**VERDICT:** `SHIPPED` (the port; serving works with prefix caching off, one open crash)
 
 **GATE:** `tests/gfx906_mla/` — decode-kernel and prefill-kernel numerics, then a tiny
 2-layer MLA model generating end to end (`pytest tests/gfx906_mla`). The real serving gate,
@@ -120,6 +120,45 @@ projections excluded from quantization):
   the first forward autotunes the stock Flash-Linear-Attention kernels (minutes on
   gfx906). The fast gate is therefore the pure-MLA variant; the hybrid one is
   `slow_test`.
+
+## First real-checkpoint bring-up (2026-10-23)
+
+`Qwen3.8-27B-GLA-g2-INT4` on 2x Radeon Pro VII, TP=2, `--dtype float16`,
+`--kv-cache-dtype float16`, text-only, 1-2 GiB KV cap:
+
+- Weights load in 14-17 s; **10.6 GiB of weights per GPU** (22 GB / 2 + shared embedding
+  and vision shards). That leaves ~5 GiB for activations + KV on a 16 GB card, which is
+  why `--gpu-memory-utilization 0.92` OOM'd in the KV allocation (11.36 GiB torch-allocated,
+  3.58 GiB free, 4.00 GiB requested): cap KV explicitly with `--kv-cache-memory-bytes`.
+- Page unification does what the geometry predicts: vLLM raises the attention block size to
+  cover the linear-attention state page (`Setting attention block size to 784/1024 tokens`,
+  `Padding mamba page size by 0.13%`), so the three MLA row widths share one page.
+- The rms invariant from the plugin's calibration blog holds: measured `rms` 1.30 / 1.39
+  (documented range 0.29-2.1), which says the partial-RoPE / q-permutation / latent pairing
+  produce sane keys.
+- Output is **correct** in eager and in graph mode, with and without prefix caching, at
+  `max-model-len` 1024: `' Paris.\nThe capital of Germany is Berlin.'`, `391` for 17*23, and
+  an exact echo test. First numbers (graph mode, batch 1, 2 GiB KV): **19.3 tok/s** decode
+  for 256 tokens; prefill timed at ~33 tok/s on a 198-token prompt (launch-bound and first
+  request, not yet a real prefill number).
+
+Two defects surfaced, one fixed and one open:
+
+1. **bf16 checkpoints need `--dtype float16` on this platform.** Serving bf16 produced
+   `expected mat1 and mat2 to have the same dtype: Half != BFloat16`, then a
+   `fused_add_rms_norm` assert, then `Both operands must be same dtype` in `tl.dot`: a
+   linear's output dtype is the backend's choice here, and it does not always match the
+   weights. The port now pins projection outputs and the prefill kernel's `q` to the layer
+   input dtype, and `_k_up_raw` follows the served dtype after load.
+2. **Partial prefix-cache hits kill the worker (OPEN).** With the plugin's
+   `--prefix-match-unit 16` default (our patch), a second request sharing a prompt prefix
+   gets a hit that lands *inside* a block (192 of 198 tokens). vLLM then issues a
+   copy-on-write of 64 blocks and the TP1 worker dies with `exit code: None` (no traceback
+   -- a hard fault, not a Python error). With `QWEN_MLA_PREFIX_UNIT=0` (partial hits off)
+   the same traffic is clean. 0.32 already trims every full-attention group (the plugin's
+   third prefix-cache fix is upstream), so the surviving suspect is the COW/copy path for
+   this hybrid layout, not the hit reconciliation. Repro: two `/v1/completions` calls whose
+   prompts share a prefix, at `--prefix-match-unit 16`.
 
 ## Interactions / superseded-by
 

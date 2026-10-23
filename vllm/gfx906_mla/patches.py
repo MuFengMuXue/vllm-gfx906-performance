@@ -271,16 +271,19 @@ def prefix_cache_hit_granularity() -> None:
     def verify_and_update_config(cls, vllm_config):
         orig(cls, vllm_config)
         cache_config = vllm_config.cache_config
+        want = os.environ.get("QWEN_MLA_PREFIX_UNIT", "16")
         if (
             ours_from(vllm_config)
             and cache_config.enable_prefix_caching
             and cache_config.mamba_cache_mode == "align"
             and cache_config.prefix_match_unit is None
+            and want != "0"
         ):
-            cache_config.prefix_match_unit = (
-                16  # hybrid block sizes are multiples of 16
+            cache_config.prefix_match_unit = int(want)
+            _log(
+                f"prefix caching: hits land on {cache_config.prefix_match_unit}-token "
+                "boundaries (QWEN_MLA_PREFIX_UNIT=0 disables partial hits)"
             )
-            _log("prefix caching: hits land on 16-token boundaries")
 
     verify_and_update_config._gfx906_mla = True
     HybridAttentionMambaModelConfig.verify_and_update_config = classmethod(
