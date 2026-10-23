@@ -12,28 +12,18 @@ MLA-specific kernel at all: two ragged attention calls per chunk, plus the LSE t
 ``merge_attn_states`` consumes.
 """
 
-import time
 from typing import TYPE_CHECKING
 
 import torch
 
-from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 
 from .ops.prefill_attention import varlen_attn
-from .ops.prefill_attention import warmup as warmup_prefill
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
     from vllm.model_executor.layers.attention.mla_attention import (
         MLACommonPrefillMetadata,
     )
-
-logger = init_logger(__name__)
-
-# (device index, dtype, head dim, num heads): the prefill and merge kernels are
-# constexpr-specialised on these, and the backend is cloned per layer.
-_WARMED: set[tuple[int, torch.dtype, int, int]] = set()
 
 
 def _starts_and_lens(cu_seq_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -41,95 +31,8 @@ def _starts_and_lens(cu_seq_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return cu_seq_lens[:-1], cu_seq_lens[1:] - cu_seq_lens[:-1]
 
 
-def _warmup_merge(
-    *, num_heads: int, v_head_dim: int, dtype: torch.dtype, device: torch.device
-) -> None:
-    """Compile both ``merge_attn_states`` variants before serving."""
-    from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
-
-    rows = 8
-    partial = torch.zeros((rows, num_heads, v_head_dim), dtype=dtype, device=device)
-    lse = torch.full((num_heads, rows), -1.0, dtype=torch.float32, device=device)
-    merged = torch.zeros_like(partial)
-    for output_lse in (None, torch.empty_like(lse)):
-        merge_attn_states(
-            output=merged,
-            prefix_output=partial,
-            prefix_lse=lse,
-            suffix_output=partial,
-            suffix_lse=lse,
-            output_lse=output_lse,
-        )
-
-
 class Gfx906TritonMLAPrefill(MLAPrefillBackend):
     """Ragged Triton flash attention for MLA prefill on gfx906."""
-
-    def __init__(
-        self,
-        num_heads: int,
-        scale: float,
-        kv_lora_rank: int,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        v_head_dim: int,
-        vllm_config: "VllmConfig",
-    ) -> None:
-        super().__init__(
-            num_heads=num_heads,
-            scale=scale,
-            kv_lora_rank=kv_lora_rank,
-            qk_nope_head_dim=qk_nope_head_dim,
-            qk_rope_head_dim=qk_rope_head_dim,
-            v_head_dim=v_head_dim,
-            vllm_config=vllm_config,
-        )
-        self._warm_up()
-
-    def _warm_up(self) -> None:
-        """Compile the prefill and merge kernels before the first request.
-
-        Neither runs until a prefill has cached context: a prefix-cache hit, or a
-        prompt longer than ``max_num_batched_tokens``. Both would otherwise JIT inside
-        the first such request -- a latency spike, and a compile landing in the middle
-        of graph capture on ROCm.
-        """
-        if not torch.cuda.is_available():
-            return
-        device = torch.device("cuda", torch.cuda.current_device())
-        dtype = torch.float16
-        if self.vllm_config is not None:
-            dtype = self.vllm_config.model_config.dtype
-        head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        key = (device.index or 0, dtype, head_dim, self.num_heads)
-        if key in _WARMED:
-            return
-        _WARMED.add(key)
-        try:
-            start = time.perf_counter()
-            warmup_prefill(
-                head_dim=head_dim,
-                num_heads=self.num_heads,
-                dtype=dtype,
-                device=device,
-            )
-            _warmup_merge(
-                num_heads=self.num_heads,
-                v_head_dim=self.v_head_dim,
-                dtype=dtype,
-                device=device,
-            )
-            torch.cuda.synchronize()
-            logger.info(
-                "gfx906 MLA prefill warmup: %s, dtype=%s, head_dim=%d, heads=%d, %.2fs",
-                device,
-                dtype,
-                head_dim,
-                self.num_heads,
-                time.perf_counter() - start,
-            )
-        except Exception:
-            logger.warning("gfx906 MLA prefill warmup failed", exc_info=True)
 
     @staticmethod
     def get_name() -> str:

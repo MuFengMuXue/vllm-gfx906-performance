@@ -233,36 +233,3 @@ def varlen_attn(
     if return_lse:
         return out, lse
     return out
-
-
-def warmup(
-    *,
-    head_dim: int,
-    num_heads: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> None:
-    """Compile ``_fwd_kernel`` for this (dtype, head_dim, causal) before serving.
-
-    Nothing else runs the context-chunk call until a prefill has cached context (a
-    prefix hit, or a prompt longer than ``max_num_batched_tokens``), so without this
-    the kernel first compiles inside a request.
-    """
-    rows = 32
-    q = torch.zeros((rows, num_heads, head_dim), dtype=dtype, device=device)
-    zero = torch.zeros(1, dtype=torch.int32, device=device)
-    n = torch.tensor([rows], dtype=torch.int32, device=device)
-    for causal in (True, False):
-        varlen_attn(
-            q,
-            q,
-            q,
-            q_start=zero,
-            q_len=n,
-            k_start=zero,
-            k_len=n,
-            max_q_len=rows,
-            scale=head_dim**-0.5,
-            causal=causal,
-            return_lse=True,
-        )

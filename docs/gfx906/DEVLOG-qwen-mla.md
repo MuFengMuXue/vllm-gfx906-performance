@@ -185,9 +185,14 @@ Two defects surfaced, one fixed and one open:
 
    Fixed in `varlen_attn` (returns `[num_heads, num_tokens]`) plus new gates: a
    merge-against-full-attention case that runs vLLM's own `merge_attn_states`, and a
-   chunked-prefill + prefix-hit e2e case. The old layout fails the merge gate. The prefill
-   and merge kernels are now also compiled at backend construction instead of during the
-   first request.
+   chunked-prefill + prefix-hit e2e case. The old layout fails the merge gate.
+
+   One thing that looked necessary and is not: precompiling the prefill/merge kernels at
+   backend construction. It warms the aligned specialization, but the real calls pass
+   slices (`q[chunk.token_slice]`, `output_lse[:, token_slice]`), so Triton still compiles
+   one more variant during the first cached-context request -- ~10 s, once, without a
+   fault across three runs. Not worth 5 s of boot-time GPU work per worker; the attempt is
+   recorded here so the next person does not repeat it.
 
    After the fix, same box and recipe, `QWEN_MLA_PREFIX_UNIT=16`: a 1,223-token prompt
    cold, the same prompt repeated (hit 1,216 tokens, `Prefix cache hit rate 34.3%`), a

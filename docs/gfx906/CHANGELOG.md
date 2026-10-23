@@ -33,8 +33,13 @@ The Qwen3.8 MLA retrofit now serves sub-block prefix-cache hits
   1,104-token prompt, then the coherence prompts — all 200 with correct output
   (`The quick brown fox jumps`, `Sphinx of black quartz, judge`, `391`, `**Paris**`), and
   the engine stays up.
-- **Also**: the prefill and merge kernels compile at backend construction now; they only
-  run once a prefill has cached context, so they used to JIT inside the first request.
+- **Not kept**: precompiling the prefill and merge kernels at backend construction. It ran
+  (`head_dim` 326, heads 12, ~5 s per worker), but the first cached-context request still
+  JIT-compiled `_fwd_kernel` and `merge_attn_states_kernel` on one rank: Triton keys a
+  pointer-alignment variant, and the real calls pass slices (`q[chunk.token_slice]`,
+  `output_lse[:, token_slice]`) whose alignment a synthetic warmup cannot reproduce. Three
+  runs showed the in-request compile is harmless here (~10 s once, no fault), so the
+  warmup was dropped instead of kept as boot-time work that does not buy its keep.
   Records: `DEVLOG-qwen-mla.md` (with a corrected hit-alignment note: the logged
   `kv lcm block sizes 3136`, not the earlier 50,176).
 
